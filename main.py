@@ -1,8 +1,10 @@
 from flask import Flask, render_template
 from flask_restful import Api, Resource
 from util import UserData, UsernameError, PlatformError, BrokenChangesError
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 api = Api(app)
 
 class Details(Resource):
