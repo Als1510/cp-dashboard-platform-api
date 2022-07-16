@@ -362,8 +362,7 @@ class UserData:
         "highest": "NA",
         "rank": "NA",
         "level": "NA",
-        "Country/Region": data["Country/Region"],
-        "Birth Year":data["Birth Year"]
+        'other':data
       }
       return details
     rows = tables[1].find_all("td")
@@ -383,9 +382,10 @@ class UserData:
         "highest": highest_rating,
         "rank": rank,
         "level": level,
-        "Country/Region": data["Country/Region"],
-        "Birth Year":data["Birth Year"]
+        'other':data
     }
+
+    print(data)
     return details
 
   def get_details(self, platform):
