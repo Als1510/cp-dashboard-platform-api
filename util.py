@@ -284,6 +284,7 @@ class UserData:
         raise UsernameError
     data = dict()
     user_profile_left = user_profile_left[0]
+    data['full_name'] = user_profile_left.find('h3',first=True).text
     p_data = user_profile_left.find('p')
     location = p_data[0].text
     data_stats = r.html.find('.profile-info-data-stats',first=True)
