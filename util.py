@@ -327,8 +327,8 @@ class UserData:
                 todo_problems.append(row.a.text)
         return todo_problems
 
-    details = {'status': 'OK', 'username': self.__username, 'location': location, 'img_scr':img, 'points': float(points), 'rank': int(rank), 'solved': get_solved_problems(),  'todo': get_todo(), 'join_date': join_date, 'institute': institute, 'problems_solved': data['Problems solved'], 
-    'solution_submitted': data['Solutions submitted'],
+    details = {'status': 'OK', 'fullname': data['full_name'], 'username': self.__username, 'location': location, 'img_scr':img, 'points': float(points), 'rank': int(rank), 'solved': get_solved_problems(),  'todo': get_todo(), 'join_date': join_date, 'institute': institute, 'problems_solved': data['Problems solved'], 
+    'solution_submitted': data['Solutions submitted']
     }
     return details
 
@@ -385,8 +385,6 @@ class UserData:
         "level": level,
         'other':data
     }
-
-    print(data)
     return details
 
   def get_details(self, platform):
