@@ -332,7 +332,7 @@ class UserData:
     return details
 
   def __atcoder(self):
-    url = "https://atcoder.jp/users/als1510"
+    url = "https://atcoder.jp/users/{}".format(self.__username)
     session = HTMLSession()
     r = session.get(url, timeout=10)
     page = requests.get(url)
