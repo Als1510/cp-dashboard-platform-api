@@ -1,5 +1,4 @@
 import json
-import json
 import re
 import requests
 from requests_html import HTMLSession
