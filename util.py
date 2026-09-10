@@ -1,8 +1,33 @@
 import json
+import logging
 import re
 import requests
 from requests_html import HTMLSession
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+
+def _log_diagnostic(platform, operation, url, username, response=None,
+                                        request_succeeded=True, **details):
+    final_url = getattr(response, 'url', url) if response is not None else url
+    diagnostic = {
+            'platform': platform,
+            'operation': operation,
+            'upstream_host': url.split('/')[2] if '://' in url else None,
+            'final_url': final_url.replace(username, '<redacted>')
+            if username else final_url,
+            'http_status': getattr(response, 'status_code', None),
+            'content_type': getattr(response, 'headers', {}).get('Content-Type')
+            if response is not None else None,
+            'request_succeeded': request_succeeded,
+    }
+    diagnostic.update(details)
+    if diagnostic.get('failure_category') is None \
+            and diagnostic['http_status'] is not None \
+            and diagnostic['http_status'] >= 400:
+        diagnostic['failure_category'] = 'UPSTREAM_HTTP_FAILURE'
+    logger.warning('platform_diagnostic %s', diagnostic)
 
 class UsernameError(Exception):
   pass
@@ -12,6 +37,103 @@ class PlatformError(Exception):
 
 class BrokenChangesError(Exception):
   pass
+
+
+class StructureError(BrokenChangesError):
+    pass
+
+
+class UpstreamError(Exception):
+    def __init__(self, platform, operation, url, message, status_code=None,
+                             username_lookup=False, cause=None):
+        super().__init__(message)
+        self.platform = platform
+        self.operation = operation
+        self.url = url
+        self.message = message
+        self.status_code = status_code
+        self.username_lookup = username_lookup
+        self.cause = cause
+
+    @property
+    def public_message(self):
+        return self.message
+
+
+class UpstreamMissingError(UpstreamError):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, message='Upstream resource not found', **kwargs)
+
+    @property
+    def public_message(self):
+        if self.username_lookup:
+            return 'Invalid username'
+        return self.message
+
+
+class UpstreamAccessError(UpstreamError):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, message='Upstream access failure', **kwargs)
+
+
+class UpstreamRateLimitError(UpstreamError):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, message='Upstream rate limited', **kwargs)
+
+
+class UpstreamServerError(UpstreamError):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, message='Upstream server failure', **kwargs)
+
+
+class UpstreamTransportError(UpstreamError):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, message='Upstream transport failure', **kwargs)
+
+
+def _validate_upstream_response(response, platform, operation, url,
+                                                                username_lookup=False):
+    status_code = response.status_code
+    error_args = {
+            'platform': platform,
+            'operation': operation,
+            'url': url,
+            'status_code': status_code,
+            'username_lookup': username_lookup,
+    }
+    if status_code == 404:
+        raise UpstreamMissingError(**error_args)
+    if status_code == 403:
+        raise UpstreamAccessError(**error_args)
+    if status_code == 429:
+        raise UpstreamRateLimitError(**error_args)
+    if status_code >= 500:
+        raise UpstreamServerError(**error_args)
+    if status_code >= 400:
+        raise UpstreamError(message='Upstream HTTP failure', **error_args)
+    return response
+
+
+def _request_get(url, platform, operation, username_lookup=False):
+    try:
+        response = requests.get(url)
+    except requests.exceptions.RequestException as error:
+        raise UpstreamTransportError(
+                platform=platform, operation=operation, url=url,
+                username_lookup=username_lookup, cause=error)
+    return _validate_upstream_response(
+            response, platform, operation, url, username_lookup)
+
+
+def _request_post(url, platform, operation, username_lookup=False, **kwargs):
+    try:
+        response = requests.post(url=url, **kwargs)
+    except requests.exceptions.RequestException as error:
+        raise UpstreamTransportError(
+                platform=platform, operation=operation, url=url,
+                username_lookup=username_lookup, cause=error)
+    return _validate_upstream_response(
+            response, platform, operation, url, username_lookup)
 
 def get_safe_nested_key(keys, dictionary):
   if not isinstance(dictionary, dict):
@@ -33,12 +155,23 @@ class UserData:
   
   def __codechef(self):
     url = 'https://www.codechef.com/users/{}'.format(self.__username)
-    page = requests.get(url)
+    page = _request_get(url, 'codechef', 'profile', username_lookup=True)
+    _log_diagnostic('codechef', 'profile', url, self.__username, page,
+                    expected_gate='rating-number')
     soup = BeautifulSoup(page.text, 'html.parser')
     try:
-        rating = soup.find('div', class_='rating-number').text
+        rating_element = soup.find('div', class_='rating-number')
+        _log_diagnostic('codechef', 'profile_parser', url, self.__username,
+                        page,
+                        expected_selector_present=rating_element is not None,
+                        parser_stage='rating_gate')
+        rating = rating_element.text
     except AttributeError:
-        raise UsernameError('User not Found')
+        _log_diagnostic('codechef', 'profile_parser', url, self.__username,
+                        page, expected_selector_present=False,
+                        parser_stage='rating_gate',
+                        failure_category='EXPECTED_SELECTOR_MISSING')
+        raise StructureError('CodeChef rating selector missing')
     stars = soup.find('span', class_='rating')
     if stars:
         stars = stars.text
@@ -111,30 +244,51 @@ class UserData:
 
   def __codeforces(self):
     url1 = 'https://codeforces.com/api/user.info?handles={}'.format(self.__username)
-    url2 = 'https://codeforces.com/contests/with/{}'.format(self.__username)
-    page1 = requests.get(url1)
-    page2 = requests.get(url2)
-    if page1.status_code != 200 and page2.status_code != 200:
-        raise UsernameError('User not found')
-    r_data = page1.json()
+    url2 = 'https://codeforces.com/api/user.rating?handle={}'.format(self.__username)
+    page1 = _request_get(url1, 'codeforces', 'user.info',
+                         username_lookup=True)
+    _log_diagnostic('codeforces', 'user.info', url1, self.__username, page1)
+    page2 = _request_get(url2, 'codeforces', 'user.rating')
+    _log_diagnostic('codeforces', 'user.rating', url2, self.__username, page2)
+    try:
+        r_data = page1.json()
+        _log_diagnostic('codeforces', 'user.info_parser', url1,
+                        self.__username, page1,
+                        json_shape_valid=isinstance(r_data, dict),
+                        result_present=bool(r_data.get('result'))
+                        if isinstance(r_data, dict) else False)
+    except Exception as error:
+        _log_diagnostic('codeforces', 'user.info_parser', url1,
+                        self.__username, page1,
+                        failure_category='UPSTREAM_RESPONSE_INVALID',
+                        exception_type=type(error).__name__)
+        raise
     data  = dict()
     data['status'] = 'OK'
     data.update(r_data['result'][0])
-    soup = BeautifulSoup(page2.text, 'html.parser')
-    table = soup.find('table', attrs={'class': 'user-contests-table'})
-    table_body = table.find('tbody')
+    try:
+        rating_data = page2.json()
+    except Exception as error:
+        raise StructureError(
+            'Codeforces user.rating response is not valid JSON') from error
+    if not isinstance(rating_data, dict) or rating_data.get('status') != 'OK':
+        raise StructureError('Codeforces user.rating response status invalid')
+    if not isinstance(rating_data.get('result'), list):
+        raise StructureError('Codeforces user.rating result is not a list')
 
-    rows = table_body.find_all('tr')
     contests = []
-    for row in rows:
-        cols = row.find_all('td')
-        cols = [ele.text.strip() for ele in cols]
+    for contest in rating_data['result']:
+        if not isinstance(contest, dict):
+            raise StructureError('Codeforces user.rating contest is not an object')
+        required_fields = {'contestName', 'rank', 'oldRating', 'newRating'}
+        if not required_fields.issubset(contest):
+            raise StructureError('Codeforces user.rating contest fields missing')
         contests.append({
-            "contest": cols[1],
-            "rank": cols[3],
-            "solved": cols[4],
-            "ratingChange": cols[5],
-            "newRating": cols[6]
+            "contest": contest['contestName'],
+            "rank": str(contest['rank']),
+            "solved": "NA",
+            "ratingChange": f"{contest['newRating'] - contest['oldRating']:+d}",
+            "newRating": str(contest['newRating'])
         })
     data['contests']=contests
     return data
@@ -170,6 +324,9 @@ class UserData:
       medium_problems_submitted = 0
       hard_problems_submitted = 0
 
+      matched_user = get_safe_nested_key(['data', 'matchedUser'], response)
+      if matched_user is None:
+          raise StructureError('LeetCode matched user missing')
       ranking = get_safe_nested_key(['data', 'matchedUser', 'profile', 'ranking'], response)
       if ranking > 100000:
           ranking = '~100000'
@@ -257,8 +414,10 @@ class UserData:
       }
 
     url = f'https://leetcode.com/{self.__username}'
-    if requests.get(url).status_code != 200:
-        raise UsernameError('User not Found')
+    profile_response = _request_get(url, 'leetcode', 'profile',
+                                    username_lookup=True)
+    _log_diagnostic('leetcode', 'profile', url, self.__username,
+                    profile_response, expected_gate='profile_status_200')
     payload = {
         "operationName": "getUserProfile",
         "variables": {
@@ -266,22 +425,46 @@ class UserData:
         },
         "query": "query getUserProfile($username: String!) {  allQuestionsCount {    difficulty    count  }  matchedUser(username: $username) {    contributions {    points      questionCount      testcaseCount    }    profile {    reputation      ranking    }    submitStats {      acSubmissionNum {        difficulty        count        submissions      }      totalSubmissionNum {        difficulty        count        submissions      }    }  }}"
     }
-    res = requests.post(url='https://leetcode.com/graphql',
-                        json=payload,
-                        headers={'referer': f'https://leetcode.com/{self.__username}/'})
-    res.raise_for_status()
-    res = res.json()
+    graphql_url = 'https://leetcode.com/graphql'
+    res = _request_post(
+        graphql_url, 'leetcode', 'graphql',
+        json=payload,
+        headers={'referer': f'https://leetcode.com/{self.__username}/'})
+    _log_diagnostic('leetcode', 'graphql', graphql_url, self.__username,
+                    res, expected_gate='graphql_json')
+    try:
+        res = res.json()
+        _log_diagnostic('leetcode', 'graphql_parser', graphql_url,
+                        self.__username,
+                        json_shape_valid=isinstance(res, dict),
+                        matched_user_present=bool(
+                            get_safe_nested_key(['data', 'matchedUser'], res)
+                        ))
+    except Exception as error:
+        _log_diagnostic('leetcode', 'graphql_parser', graphql_url,
+                        self.__username,
+                        failure_category='UPSTREAM_RESPONSE_INVALID',
+                        exception_type=type(error).__name__)
+        raise StructureError('LeetCode GraphQL response is not valid JSON') from error
     return __parse_response(res)
 
   def __spoj(self):
     url = "https://www.spoj.com/users/{}/".format(self.__username)
     session = HTMLSession()
-    r = session.get(url,timeout=10)
-    if r.status_code !=200:
-        raise UsernameError("User not found")
-    user_profile_left = r.html.find("#user-profile-left")
+    try:
+        r = session.get(url,timeout=10)
+    except requests.exceptions.RequestException as error:
+        raise UpstreamTransportError(
+            platform='spoj', operation='profile', url=url,
+            username_lookup=True, cause=error)
+    _validate_upstream_response(r, 'spoj', 'profile', url, True)
+    _log_diagnostic('spoj', 'profile', url, self.__username, r)
+    profile_elements = r.html.find("#user-profile-left")
+    _log_diagnostic('spoj', 'profile_parser', url, self.__username, r,
+                    profile_container_present=bool(profile_elements))
+    user_profile_left = profile_elements
     if not len(user_profile_left):
-        raise UsernameError
+        raise StructureError('SPOJ profile container missing')
     data = dict()
     user_profile_left = user_profile_left[0]
     data['full_name'] = user_profile_left.find('h3',first=True).text
@@ -292,7 +475,8 @@ class UserData:
     dds = data_stats.find('dd')
     for dt,dd in zip(dts,dds):
       data[dt.text] = dd.text
-    page = requests.get(url)
+    page = _request_get(url, 'spoj', 'profile_details')
+    _log_diagnostic('spoj', 'profile_details', url, self.__username, page)
     soup = BeautifulSoup(page.text, 'html.parser')
     top=soup.find('div', id='user-profile-left')
     img = top.find('img')['src']
@@ -335,46 +519,58 @@ class UserData:
   def __atcoder(self):
     url = "https://atcoder.jp/users/{}".format(self.__username)
     session = HTMLSession()
-    r = session.get(url, timeout=10)
-    page = requests.get(url)
-    if page.status_code != 200 and r.status_code != 200:
-        raise UsernameError("User not Found")
+    try:
+        r = session.get(url, timeout=10)
+    except requests.exceptions.RequestException as error:
+        raise UpstreamTransportError(
+            platform='atcoder', operation='profile_html_session', url=url,
+            username_lookup=True, cause=error)
+    _validate_upstream_response(r, 'atcoder', 'profile_html_session', url, True)
+    _log_diagnostic('atcoder', 'profile_html_session', url,
+                    self.__username, r)
+    page = _request_get(url, 'atcoder', 'profile_requests', True)
+    _log_diagnostic('atcoder', 'profile_requests', url, self.__username, page)
     data_tables = r.html.find('.dl-table')
+    _log_diagnostic('atcoder', 'profile_parser', url, self.__username, r,
+                    dl_table_count=len(data_tables),
+                    expected_gate='at_least_one_dl_table')
     if not len(data_tables):
-        raise UsernameError('User not found')
-    data = dict()
-    for table in data_tables:
-      data_rows = table.find('tr')
-      for row in data_rows:
-        attr = row.find('th',first=True).text
-        val = row.find('td',first=True).text
-        data[attr]=val
-        if attr == 'Highest Rating':
-          val = val.split()[0]
-          data[attr]=val
+        raise StructureError('AtCoder profile table missing')
     soup = BeautifulSoup(page.text, "html.parser")
     tables = soup.find_all("table", class_="dl-table")
-    if len(tables) < 2:
-      details = {
-        "status": "OK",
-        "username": self.__username,
-        "platform": "Atcoder",
-        "rating": "NA",
-        "highest": "NA",
-        "rank": "NA",
-        "level": "NA",
-        'other':data
-      }
-      return details
-    rows = tables[1].find_all("td")
-    try:
-        rank = int(rows[0].text[:-2])
-        current_rating = int(rows[1].text)
-        spans = rows[2].find_all("span")
-        highest_rating = int(spans[0].text)
-        level = spans[2].text
-    except Exception as E:
-        raise BrokenChangesError(E)
+    data = dict()
+    known_profile_labels = {
+        'Country/Region', 'Birth Year', 'Affiliation', 'Rating',
+        'Highest Rating', 'Rank', 'Level'
+    }
+    for table in tables:
+      for row in table.find_all('tr'):
+        header = row.find('th')
+        value_cell = row.find('td')
+        if header is None or value_cell is None:
+          continue
+        label = header.get_text(strip=True)
+        spans = value_cell.find_all('span')
+        value = (spans[-1].get_text(strip=True)
+                 if label == 'Level' and spans
+                 else value_cell.get_text(' ', strip=True))
+        data[label] = value
+    if not known_profile_labels.intersection(data):
+      raise StructureError('AtCoder profile labels missing')
+    _log_diagnostic('atcoder', 'rating_parser', url, self.__username, page,
+                    dl_table_count=len(tables),
+                    rating_fields_present=bool(
+                        {'Rating', 'Highest Rating', 'Rank', 'Level'}
+                        .intersection(data)))
+
+    def numeric_or_na(value):
+      match = re.search(r'\d+', value or '')
+      return int(match.group()) if match else 'NA'
+
+    current_rating = numeric_or_na(data.get('Rating'))
+    highest_rating = numeric_or_na(data.get('Highest Rating'))
+    rank = numeric_or_na(data.get('Rank'))
+    level = data.get('Level', 'NA')
     details = {
         "status": "OK",
         "platform": "Atcoder",

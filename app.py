@@ -1,6 +1,7 @@
 from flask import Flask, render_template
 from flask_restful import Api, Resource
-from util import UserData, UsernameError, PlatformError, BrokenChangesError
+from util import (UserData, UsernameError, PlatformError, BrokenChangesError,
+                  UpstreamError)
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -20,6 +21,9 @@ class Details(Resource):
 
     except PlatformError:
       return {'status': 'Failed', 'details': 'Invalid Platform'}
+
+    except UpstreamError as error:
+      return {'status': 'Failed', 'details': error.public_message}
         
     except BrokenChangesError:
       return {'status': 'Failed', 'details': 'API broken due to site changes'}

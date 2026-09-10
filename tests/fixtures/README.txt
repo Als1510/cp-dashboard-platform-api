@@ -1,0 +1,1 @@
+Minimal response fixtures for the current implementation. They intentionally preserve the selectors and positional structures consumed by util.py.
