@@ -415,6 +415,15 @@ class TestFailureCharacterization(unittest.TestCase):
             with self.assertRaises(util.StructureError):
                 util.UserData("missing").get_details("codechef")
 
+    def test_codechef_inactive_rank_returns_na(self):
+        html = fixture_text("codechef", "profile.html").replace(
+            '<a><strong>10</strong></a><a><strong>20</strong></a>',
+            '<a><strong>\n                                Inactive                            </strong></a><a><strong>20</strong></a>')
+        with patch.object(util.requests, "get", return_value=FakeResponse(text=html)):
+            result = util.UserData("als1510").get_details("codechef")
+        self.assertEqual(result["global_rank"], "NA")
+        self.assertEqual(result["country_rank"], 20)
+
     def test_codeforces_empty_api_result_raises_index_error(self):
         api_error = {"status": "FAILED", "comment": "not found", "result": []}
         responses = [FakeResponse(json_data=api_error), FakeResponse(text="<html></html>")]

@@ -183,9 +183,16 @@ class UserData:
     rating_ranks = rating_ranks_container.find_all('a')
     global_rank = rating_ranks[0].strong.text
     country_rank = rating_ranks[1].strong.text
-    if global_rank != 'NA':
-        global_rank = int(global_rank)
-        country_rank = int(country_rank)
+    global_rank_text = global_rank.strip() if global_rank else ''
+    country_rank_text = country_rank.strip() if country_rank else ''
+    if global_rank_text.isdigit():
+        global_rank = int(global_rank_text)
+    else:
+        global_rank = 'NA'
+    if country_rank_text.isdigit():
+        country_rank = int(country_rank_text)
+    else:
+        country_rank = 'NA'
     
     def contest_rating_details_get():
         start_ind = page.text.find('[', page.text.find('all_rating'))
