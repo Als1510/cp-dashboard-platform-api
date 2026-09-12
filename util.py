@@ -114,9 +114,9 @@ def _validate_upstream_response(response, platform, operation, url,
     return response
 
 
-def _request_get(url, platform, operation, username_lookup=False):
+def _request_get(url, platform, operation, username_lookup=False, headers=None, timeout=None):
     try:
-        response = requests.get(url)
+        response = requests.get(url, headers=headers, timeout=timeout)
     except requests.exceptions.RequestException as error:
         raise UpstreamTransportError(
                 platform=platform, operation=operation, url=url,
@@ -155,7 +155,9 @@ class UserData:
   
   def __codechef(self):
     url = 'https://www.codechef.com/users/{}'.format(self.__username)
-    page = _request_get(url, 'codechef', 'profile', username_lookup=True)
+    page = _request_get(url, 'codechef', 'profile', username_lookup=True,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
+                        timeout=10)
     _log_diagnostic('codechef', 'profile', url, self.__username, page,
                     expected_gate='rating-number')
     soup = BeautifulSoup(page.text, 'html.parser')
@@ -413,11 +415,7 @@ class UserData:
           'reputation': str(reputation)
       }
 
-    url = f'https://leetcode.com/{self.__username}'
-    profile_response = _request_get(url, 'leetcode', 'profile',
-                                    username_lookup=True)
-    _log_diagnostic('leetcode', 'profile', url, self.__username,
-                    profile_response, expected_gate='profile_status_200')
+    url = 'https://leetcode.com/graphql'
     payload = {
         "operationName": "getUserProfile",
         "variables": {
@@ -425,32 +423,41 @@ class UserData:
         },
         "query": "query getUserProfile($username: String!) {  allQuestionsCount {    difficulty    count  }  matchedUser(username: $username) {    contributions {    points      questionCount      testcaseCount    }    profile {    reputation      ranking    }    submitStats {      acSubmissionNum {        difficulty        count        submissions      }      totalSubmissionNum {        difficulty        count        submissions      }    }  }}"
     }
-    graphql_url = 'https://leetcode.com/graphql'
     res = _request_post(
-        graphql_url, 'leetcode', 'graphql',
+        url, 'leetcode', 'graphql',
         json=payload,
-        headers={'referer': f'https://leetcode.com/{self.__username}/'})
-    _log_diagnostic('leetcode', 'graphql', graphql_url, self.__username,
+        headers={
+            'referer': f'https://leetcode.com/{self.__username}/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        timeout=10)
+    _log_diagnostic('leetcode', 'graphql', url, self.__username,
                     res, expected_gate='graphql_json')
     try:
         res = res.json()
-        _log_diagnostic('leetcode', 'graphql_parser', graphql_url,
+        _log_diagnostic('leetcode', 'graphql_parser', url,
                         self.__username,
                         json_shape_valid=isinstance(res, dict),
                         matched_user_present=bool(
                             get_safe_nested_key(['data', 'matchedUser'], res)
                         ))
     except Exception as error:
-        _log_diagnostic('leetcode', 'graphql_parser', graphql_url,
+        _log_diagnostic('leetcode', 'graphql_parser', url,
                         self.__username,
                         failure_category='UPSTREAM_RESPONSE_INVALID',
                         exception_type=type(error).__name__)
         raise StructureError('LeetCode GraphQL response is not valid JSON') from error
+    matched_user = get_safe_nested_key(['data', 'matchedUser'], res)
+    if matched_user is None:
+        raise UsernameError('Invalid username')
     return __parse_response(res)
 
   def __spoj(self):
     url = "https://www.spoj.com/users/{}/".format(self.__username)
     session = HTMLSession()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
     try:
         r = session.get(url,timeout=10)
     except requests.exceptions.RequestException as error:
@@ -475,9 +482,8 @@ class UserData:
     dds = data_stats.find('dd')
     for dt,dd in zip(dts,dds):
       data[dt.text] = dd.text
-    page = _request_get(url, 'spoj', 'profile_details')
-    _log_diagnostic('spoj', 'profile_details', url, self.__username, page)
-    soup = BeautifulSoup(page.text, 'html.parser')
+    _log_diagnostic('spoj', 'profile_details', url, self.__username, r)
+    soup = BeautifulSoup(r.text, 'html.parser')
     top=soup.find('div', id='user-profile-left')
     img = top.find('img')['src']
     details_container = soup.find_all('p')

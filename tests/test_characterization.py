@@ -76,11 +76,13 @@ class FakeHTMLResponse:
     def __init__(self, html, status_code=200):
         self.status_code = status_code
         self.html = FakeHTML(html)
+        self.text = html
 
 
 class FakeHTMLSession:
     def __init__(self, html, status_code=200):
         self.response = FakeHTMLResponse(html, status_code)
+        self.headers = {}
 
     def get(self, url, timeout=None):
         return self.response
@@ -168,10 +170,7 @@ class TestPlatformCharacterization(unittest.TestCase):
 
     def test_leetcode_current_graphql_response_fields(self):
         graphql = json.loads(fixture_text("leetcode", "profile.json"))
-        responses = [FakeResponse(status_code=200), FakeResponse(status_code=200, json_data=graphql)]
-        with patch.object(util.requests, "get", side_effect=responses[:1]), patch.object(
-            util.requests, "post", return_value=responses[1]
-        ):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=200, json_data=graphql)):
             result = util.UserData("als1510").get_details("leetcode")
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["ranking"], "50000")
@@ -182,6 +181,45 @@ class TestPlatformCharacterization(unittest.TestCase):
         self.assertEqual(result["easy_questions_solved"], "50")
         self.assertEqual(result["total_hard_questions"], "700")
         self.assertEqual(result["contribution_points"], "25")
+
+    def test_leetcode_nonexistent_user_is_invalid_username(self):
+        graphql = json.loads(fixture_text("leetcode", "profile.json"))
+        graphql["data"]["matchedUser"] = None
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=200, json_data=graphql)):
+            with self.assertRaises(util.UsernameError):
+                util.UserData("missing").get_details("leetcode")
+
+    def test_leetcode_forbidden_is_upstream_access_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=403)):
+            with self.assertRaises(util.UpstreamAccessError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_rate_limit_is_upstream_rate_limit_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=429)):
+            with self.assertRaises(util.UpstreamRateLimitError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_server_error_is_upstream_server_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=503)):
+            with self.assertRaises(util.UpstreamServerError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_transport_error_is_upstream_transport_error(self):
+        with patch.object(util.requests, "post", side_effect=requests.Timeout()):
+            with self.assertRaises(util.UpstreamTransportError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_malformed_json_is_structure_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(text="not json")):
+            with self.assertRaises(util.StructureError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_does_not_request_profile_html(self):
+        graphql = json.loads(fixture_text("leetcode", "profile.json"))
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=200, json_data=graphql)) as post_mock:
+            util.UserData("als1510").get_details("leetcode")
+        self.assertEqual(post_mock.call_count, 1)
+        self.assertEqual(post_mock.call_args.kwargs["url"], "https://leetcode.com/graphql")
 
     def test_atcoder_current_response_fields(self):
         html = fixture_text("atcoder", "current_profile.html")
@@ -250,15 +288,12 @@ class TestDiagnosticLogging(unittest.TestCase):
         self.assertIn("'operation': 'user.rating'", output)
         self.assertIn("'result_present': True", output)
 
-    def test_leetcode_logs_profile_graphql_and_json_stages(self):
+    def test_leetcode_logs_graphql_and_json_stages(self):
         graphql = json.loads(fixture_text("leetcode", "profile.json"))
-        with patch.object(util.requests, "get", return_value=FakeResponse()), patch.object(
-            util.requests, "post", return_value=FakeResponse(json_data=graphql)
-        ):
+        with patch.object(util.requests, "post", return_value=FakeResponse(json_data=graphql)):
             with self.assertLogs(util.logger, level="WARNING") as captured:
                 util.UserData("als1510").get_details("leetcode")
         output = "\n".join(captured.output)
-        self.assertIn("'operation': 'profile'", output)
         self.assertIn("'operation': 'graphql'", output)
         self.assertIn("'operation': 'graphql_parser'", output)
         self.assertIn("'matched_user_present': True", output)
@@ -274,6 +309,16 @@ class TestDiagnosticLogging(unittest.TestCase):
         output = "\n".join(captured.output)
         self.assertIn("'dl_table_count': 1", output)
         self.assertIn("'rating_fields_present': False", output)
+
+    def test_leetcode_logs_graphql_parser_stage(self):
+        graphql = json.loads(fixture_text("leetcode", "profile.json"))
+        with patch.object(util.requests, "post", return_value=FakeResponse(json_data=graphql)):
+            with self.assertLogs(util.logger, level="WARNING") as captured:
+                util.UserData("als1510").get_details("leetcode")
+        output = "\n".join(captured.output)
+        self.assertIn("'operation': 'graphql'", output)
+        self.assertIn("'operation': 'graphql_parser'", output)
+        self.assertIn("'matched_user_present': True", output)
 
     def test_spoj_logs_profile_container_and_second_request(self):
         html = fixture_text("spoj", "profile.html")
@@ -306,9 +351,63 @@ class TestFailureCharacterization(unittest.TestCase):
                 util.UserData("als1510").get_details("codechef")
 
     def test_codechef_transport_error_is_shared_error(self):
-        with patch.object(util.requests, "get", side_effect=requests.Timeout()):
+        with patch.object(util.requests, "get", side_effect=requests.Timeout()) as get_mock:
             with self.assertRaises(util.UpstreamTransportError):
                 util.UserData("als1510").get_details("codechef")
+        self.assertEqual(get_mock.call_args.kwargs["timeout"], 10)
+        self.assertEqual(get_mock.call_args.kwargs["headers"]["User-Agent"],
+                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    def test_codechef_gets_explicit_user_agent_timeout_and_parses_success(self):
+        html = fixture_text("codechef", "profile.html")
+        with patch.object(util.requests, "get", return_value=FakeResponse(status_code=200, text=html)) as get_mock:
+            result = util.UserData("als1510").get_details("codechef")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["rating"], 1500)
+        self.assertEqual(result["stars"], "3 star")
+        self.assertEqual(get_mock.call_args.kwargs["timeout"], 10)
+        self.assertEqual(get_mock.call_args.kwargs["headers"]["User-Agent"],
+                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    def test_codechef_403_still_maps_to_upstream_access_error(self):
+        with patch.object(util.requests, "get", return_value=FakeResponse(status_code=403)) as get_mock:
+            with self.assertRaises(util.UpstreamAccessError):
+                util.UserData("als1510").get_details("codechef")
+        self.assertEqual(get_mock.call_args.kwargs["timeout"], 10)
+        self.assertEqual(get_mock.call_args.kwargs["headers"]["User-Agent"],
+                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    def test_leetcode_forbidden_is_upstream_access_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=403)):
+            with self.assertRaises(util.UpstreamAccessError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_rate_limit_is_upstream_rate_limit_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=429)):
+            with self.assertRaises(util.UpstreamRateLimitError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_server_error_is_upstream_server_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=503)):
+            with self.assertRaises(util.UpstreamServerError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_transport_error_is_upstream_transport_error(self):
+        with patch.object(util.requests, "post", side_effect=requests.Timeout()):
+            with self.assertRaises(util.UpstreamTransportError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_malformed_json_is_structure_error(self):
+        with patch.object(util.requests, "post", return_value=FakeResponse(text="not json")):
+            with self.assertRaises(util.StructureError):
+                util.UserData("als1510").get_details("leetcode")
+
+    def test_leetcode_nonexistent_user_is_invalid_username(self):
+        graphql = json.loads(fixture_text("leetcode", "profile.json"))
+        graphql["data"]["matchedUser"] = None
+        with patch.object(util.requests, "post", return_value=FakeResponse(status_code=200, json_data=graphql)):
+            with self.assertRaises(util.UsernameError):
+                util.UserData("missing").get_details("leetcode")
 
     def test_codechef_missing_rating_is_structure_error(self):
         html = "<html><body><div class='rating-header'></div></body></html>"
@@ -386,50 +485,7 @@ class TestFailureCharacterization(unittest.TestCase):
             with self.assertRaises(util.StructureError):
                 util.UserData("als1510").get_details("codeforces")
 
-    def test_leetcode_missing_matched_user_is_structure_error(self):
-        graphql = {"data": {"allQuestionsCount": [], "matchedUser": None}}
-        with patch.object(util.requests, "get", return_value=FakeResponse()), patch.object(
-            util.requests, "post", return_value=FakeResponse(json_data=graphql)
-        ):
-            with self.assertRaises(util.StructureError):
-                util.UserData("missing").get_details("leetcode")
 
-    def test_leetcode_graphql_http_error_is_upstream_server_error(self):
-        with patch.object(util.requests, "get", return_value=FakeResponse()), patch.object(
-            util.requests, "post", return_value=FakeResponse(status_code=500)
-        ):
-            with self.assertRaises(util.UpstreamServerError):
-                util.UserData("als1510").get_details("leetcode")
-
-    def test_leetcode_profile_forbidden_is_access_error_and_stops_before_graphql(self):
-        with patch.object(util.requests, "get", return_value=FakeResponse(status_code=403)), patch.object(
-            util.requests, "post"
-        ) as post_mock:
-            with self.assertRaises(util.UpstreamAccessError):
-                util.UserData("als1510").get_details("leetcode")
-        post_mock.assert_not_called()
-
-    def test_leetcode_profile_rate_limit_is_shared_error(self):
-        with patch.object(util.requests, "get", return_value=FakeResponse(status_code=429)):
-            with self.assertRaises(util.UpstreamRateLimitError):
-                util.UserData("als1510").get_details("leetcode")
-
-    def test_leetcode_profile_server_error_is_shared_error(self):
-        with patch.object(util.requests, "get", return_value=FakeResponse(status_code=503)):
-            with self.assertRaises(util.UpstreamServerError):
-                util.UserData("als1510").get_details("leetcode")
-
-    def test_leetcode_profile_transport_error_is_shared_error(self):
-        with patch.object(util.requests, "get", side_effect=requests.Timeout()):
-            with self.assertRaises(util.UpstreamTransportError):
-                util.UserData("als1510").get_details("leetcode")
-
-    def test_leetcode_malformed_graphql_json_is_structure_error(self):
-        with patch.object(util.requests, "get", return_value=FakeResponse()), patch.object(
-            util.requests, "post", return_value=FakeResponse(text="not json")
-        ):
-            with self.assertRaises(util.StructureError):
-                util.UserData("als1510").get_details("leetcode")
 
     def test_atcoder_missing_profile_table_is_structure_error(self):
         html = "<html><body></body></html>"
